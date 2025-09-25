@@ -1,33 +1,39 @@
 # streamlit_poc_app.py
-# Proof-of-concept Streamlit app for the generic data-processing pipeline
-# Features:
-# - OpenAI API connectivity test
-# - Upload CSV / Excel files
-# - Data preview and type detection
-# - Missing value detection & simple visualizations
-# - Duplicate detection
-# - Outlier identification (IQR method)
-# - Basic cleaning actions (drop/select/replace/impute)
-# - Export cleaned data (CSV / Excel)
-
-# Requirements (put these in requirements.txt):
-# streamlit
-# pandas
-# numpy
-#plotly
-# openai
-# xlrd (if older Excel files)
-# openpyxl
+# POC Streamlit app — upgraded with requested changes
+# - Updated OpenAI usage to the modern client API
+# - File-size validation and configurable limit
+# - Sampling-based "numeric-ish" detection for performance
+# - Change-log / action history with before/after stats for cleaning actions
+# - Mixed-type detection and simple coercion UI
+# - Imputation shows before/after statistics
+#
+# Note: This file is intentionally self-contained for learning. For production
+# please split utilities into a `utils.py`, add unit tests, and add CI as discussed.
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import os
 import io
+import json
+import time
 import plotly.express as px
-import openai
+from datetime import datetime
 
-st.set_page_config(page_title="Data Tools POC", layout="wide")
+# Try to import the modern OpenAI client. The package may expose it as
+# `from openai import OpenAI` depending on the installed version. We handle
+# absence gracefully so app runs without the dependency.
+try:
+    from openai import OpenAI as OpenAIClient
+except Exception:
+    OpenAIClient = None
+
+st.set_page_config(page_title="Data Tools POC — Upgraded", layout="wide")
+
+# --------------------------- Configurable limits ---------------------------
+DEFAULT_MAX_FILE_MB = 50  # warn above this size
+SAMPLE_SIZE = 1000        # rows sampled for expensive heuristics
+MAX_HISTORY = 10          # keep last N snapshots in memory
 
 # --------------------------- Utilities ---------------------------
 @st.cache_data
@@ -35,41 +41,57 @@ def load_csv(file) -> pd.DataFrame:
     return pd.read_csv(file)
 
 @st.cache_data
-def load_excel(file) -> pd.DataFrame:
-    # loads first sheet; can be extended
+def load_excel_sheets(file):
     xl = pd.ExcelFile(file)
-    return xl.parse(xl.sheet_names[0])
+    return {name: xl.parse(name) for name in xl.sheet_names}
 
-def detect_types(df: pd.DataFrame) -> pd.DataFrame:
-    types = pd.DataFrame({
-        'column': df.columns,
-        'pandas_dtype': df.dtypes.astype(str),
-        'n_unique': df.nunique().values,
-        'pct_missing': (df.isna().sum() / len(df) * 100).round(2).values
-    })
-    # simple heuristic for semantic types
-    semantic = []
+def sample_series(series: pd.Series, n=SAMPLE_SIZE):
+    """Return a sample (or head segment) of non-null values from a series."""
+    non_null = series.dropna()
+    ln = len(non_null)
+    if ln == 0:
+        return non_null
+    if ln <= n:
+        return non_null.iloc[:n]
+    # sample is more expensive than iloc slice, but gives variety
+    return non_null.sample(n=n, random_state=0)
+
+def is_numeric_ish(series: pd.Series, sample_size=SAMPLE_SIZE) -> bool:
+    """Fast heuristic to check if a text/object column mostly contains numbers.
+
+    We sample up to `sample_size` non-null values and try coercion. If a high
+    fraction (e.g. >90%) coerce to numeric, we call it numeric-ish.
+    """
+    s = sample_series(series, sample_size)
+    if len(s) == 0:
+        return False
+    coerced = pd.to_numeric(s, errors='coerce')
+    success_ratio = coerced.notna().mean()
+    return success_ratio >= 0.9
+
+def detect_types_fast(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a lightweight type summary using sampling for object columns."""
+    rows = []
     for col in df.columns:
-        s = df[col]
-        if pd.api.types.is_numeric_dtype(s):
-            semantic.append('numeric')
-        elif pd.api.types.is_datetime64_any_dtype(s):
-            semantic.append('datetime')
-        elif pd.api.types.is_bool_dtype(s):
-            semantic.append('boolean')
+        ser = df[col]
+        pandas_dtype = str(ser.dtypes)
+        n_unique = ser.nunique(dropna=True)
+        pct_missing = round(ser.isna().mean() * 100, 2)
+        if pd.api.types.is_numeric_dtype(ser):
+            semantic = 'numeric'
+        elif pd.api.types.is_datetime64_any_dtype(ser):
+            semantic = 'datetime'
+        elif pd.api.types.is_bool_dtype(ser):
+            semantic = 'boolean'
         else:
-            # if many unique values but all digits, maybe numeric stored as string
-            try:
-                pd.to_numeric(s.dropna())
-                semantic.append('numeric-ish')
-            except Exception:
-                semantic.append('categorical/text')
-    types['semantic_type'] = semantic
-    return types
+            # sample expensive coercions
+            semantic = 'numeric-ish' if is_numeric_ish(ser) else 'categorical/text'
+        rows.append({'column': col, 'pandas_dtype': pandas_dtype, 'n_unique': n_unique, 'pct_missing': pct_missing, 'semantic_type': semantic})
+    return pd.DataFrame(rows)
 
-def detect_outliers_iqr(df: pd.DataFrame, col: str):
+def detect_outliers_iqr(df: pd.DataFrame, col: str) -> pd.Series:
     if not pd.api.types.is_numeric_dtype(df[col]):
-        return pd.Series([False] * len(df))
+        return pd.Series([False] * len(df), index=df.index)
     q1 = df[col].quantile(0.25)
     q3 = df[col].quantile(0.75)
     iqr = q3 - q1
@@ -77,195 +99,332 @@ def detect_outliers_iqr(df: pd.DataFrame, col: str):
     upper = q3 + 1.5 * iqr
     return (df[col] < lower) | (df[col] > upper)
 
-# --------------------------- Sidebar: OpenAI check & Upload ---------------------------
+# --------------------------- Change log helpers ---------------------------
+
+def log_action(action_type: str, details: dict):
+    """Append an action summary to session_state['changelog'] with timestamp."""
+    entry = {'time': datetime.utcnow().isoformat() + 'Z', 'action': action_type, 'details': details}
+    if 'changelog' not in st.session_state:
+        st.session_state['changelog'] = []
+    st.session_state['changelog'].append(entry)
+    # Bound the changelog size
+    st.session_state['changelog'] = st.session_state['changelog'][-MAX_HISTORY:]
+
+# --------------------------- Sidebar: Env & Upload ---------------------------
 st.sidebar.header("Environment & Upload")
 api_key = st.sidebar.text_input("OpenAI API Key (or set OPENAI_API_KEY env var)", type="password")
 if api_key:
     os.environ['OPENAI_API_KEY'] = api_key
 
-if 'OPENAI_API_KEY' in os.environ and os.environ['OPENAI_API_KEY']:
-    openai.api_key = os.environ['OPENAI_API_KEY']
+# Choose max upload limit for this session
+max_file_mb = st.sidebar.number_input("Max file size (MB)", min_value=1, max_value=1024, value=DEFAULT_MAX_FILE_MB)
+
+# Note on dependencies
+st.sidebar.markdown("**Dependencies note:** `python-multipart` is not required for Streamlit uploads. Ensure `openpyxl` is present for Excel files."
+                    
+"Recommended: `streamlit, pandas, numpy, plotly, openai, openpyxl`.")
+
+# Initialize OpenAI client (modern API) if available and key present
+openai_client = None
+if OpenAIClient is not None and os.environ.get('OPENAI_API_KEY'):
     try:
-        # lightweight connectivity check - list models might be rate-limited; use a minimal call
-        # For safety we only test that import and key assignment succeed; avoid heavy API calls.
-        _ = openai.__version__
-        st.sidebar.success("OpenAI lib loaded — key set (connectivity test skipped).")
+        openai_client = OpenAIClient()
+        st.sidebar.success('OpenAI client initialized')
     except Exception as e:
-        st.sidebar.error(f"OpenAI lib error: {e}")
-else:
-    st.sidebar.info("OpenAI API key not set — you can set it here for LLM-powered insights.")
+        st.sidebar.error(f'OpenAI init failed: {e}')
 
 uploaded_file = st.sidebar.file_uploader("Upload CSV / Excel file", type=["csv","xls","xlsx"], accept_multiple_files=False)
 
 # --------------------------- Main layout ---------------------------
-st.title("Data Tools — Proof of Concept")
-st.markdown("A minimal, generic data ingestion & cleaning interface. You're the builder; extend as needed.")
+st.title("Data Tools — Upgraded POC")
+st.markdown("Upload a tabular file (CSV / Excel). This POC shows fast detection, basic cleaning, a changelog, and optional LLM-driven insights.")
+
+# Provide a small quick-example loader (user can paste a public CSV URL)
+with st.expander('Load sample public dataset (URL)', expanded=False):
+    sample_url = st.text_input('Public CSV URL (e.g. raw GitHub file or data repo)')
+    if st.button('Load sample URL') and sample_url:
+        try:
+            df_sample = pd.read_csv(sample_url)
+            st.session_state['uploaded_df'] = df_sample
+            st.success('Sample loaded into session (saved as uploaded_df)')
+        except Exception as e:
+            st.error(f'Failed to load sample: {e}')
+
+# Use either uploaded file or session sample
+df = None
+sheets = None
+selected_sheet = None
+if 'uploaded_df' in st.session_state and uploaded_file is None:
+    df = st.session_state['uploaded_df']
 
 if uploaded_file is not None:
-    filename = uploaded_file.name
-    st.subheader(f"Loaded: {filename}")
+    # File size validation — Streamlit's uploaded_file has .size in bytes
     try:
-        if filename.lower().endswith('.csv'):
-            df = load_csv(uploaded_file)
-        else:
-            df = load_excel(uploaded_file)
-    except Exception as e:
-        st.error(f"Failed to read file: {e}")
-        st.stop()
+        size_mb = uploaded_file.size / (1024*1024)
+    except Exception:
+        # fallback: unknown size — proceed but warn
+        size_mb = None
 
-    # Show preview and basic info
-    st.write("**Preview**")
-    st.dataframe(df.head(200))
-
-    st.write("---")
-    st.write("**Detected column types & summary**")
-    types_df = detect_types(df)
-    st.dataframe(types_df)
-
-    # Missing values panel
-    st.write("---")
-    st.header("Missing values & duplicates")
-    col1, col2 = st.columns([2,1])
-    with col1:
-        mv = df.isna().sum().sort_values(ascending=False)
-        mv = mv[mv>0]
-        if mv.empty:
-            st.success("No missing values detected")
-        else:
-            mv_df = mv.reset_index()
-            mv_df.columns = ['column','missing_count']
-            mv_df['pct_missing'] = (mv_df['missing_count'] / len(df) * 100).round(2)
-            st.dataframe(mv_df)
-            sel_mv_col = st.selectbox('Select column to visualize missing pattern', options=mv_df['column'].tolist())
-            # show missing vs present scatter (by row index)
-            viz = df[sel_mv_col].isna().astype(int).reset_index().rename(columns={sel_mv_col:'is_missing'})
-            fig = px.bar(viz, x='index', y='is_missing', title=f'Missingness in {sel_mv_col}', labels={'is_missing':'is_missing (1=missing)'})
-            st.plotly_chart(fig, use_container_width=True)
-    with col2:
-        dup_count = df.duplicated().sum()
-        st.metric("Duplicate rows", f"{dup_count}")
-        if dup_count>0:
-            if st.button("Show duplicate sample"):
-                st.dataframe(df[df.duplicated(keep=False)].head(200))
-
-    # Outliers
-    st.write("---")
-    st.header("Outlier detection (IQR)")
-    numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    if numeric_cols:
-        chosen = st.selectbox('Choose numeric column to scan for outliers', options=numeric_cols)
-        outlier_mask = detect_outliers_iqr(df, chosen)
-        st.write(f"Outliers found: {outlier_mask.sum()} of {len(df)}")
-        if outlier_mask.sum()>0:
-            st.dataframe(df.loc[outlier_mask, [chosen]].head(200))
-            fig = px.box(df, y=chosen, title=f'Box plot — {chosen}')
-            st.plotly_chart(fig, use_container_width=True)
+    if size_mb is not None and size_mb > max_file_mb:
+        st.error(f"Uploaded file is {size_mb:.1f} MB which exceeds the limit of {max_file_mb} MB. Please increase the limit or upload a smaller file.")
     else:
-        st.info("No numeric columns detected for outlier scanning.")
+        name = uploaded_file.name.lower()
+        try:
+            if name.endswith('.csv'):
+                df = load_csv(uploaded_file)
+            else:
+                sheets = load_excel_sheets(uploaded_file)
+                sheet_names = list(sheets.keys())
+                selected_sheet = st.sidebar.selectbox('Choose worksheet', options=sheet_names)
+                if selected_sheet:
+                    df = sheets[selected_sheet]
+                else:
+                    df = sheets[sheet_names[0]]
+        except Exception as e:
+            st.error(f'Failed to read file: {e}')
 
-    # Basic cleaning actions
-    st.write("---")
-    st.header("Basic cleaning actions")
-    st.write("Choose actions below and then press **Apply**. Changes are kept in-memory for this session.")
+# If still no df, show instructions and stop
+if df is None:
+    st.info('Upload a CSV/Excel file from the sidebar or load a public CSV URL above to get started.')
+    st.stop()
 
-    # We'll keep a session-state copy
-    if 'work_df' not in st.session_state:
-        st.session_state['work_df'] = df.copy()
+# Ensure df is a DataFrame
+if not isinstance(df, pd.DataFrame):
+    st.error('Loaded object is not a DataFrame')
+    st.stop()
 
-    work_df = st.session_state['work_df']
+# Initialize working copy and history
+if 'work_df' not in st.session_state or st.session_state.get('source_id') != id(df):
+    st.session_state['work_df'] = df.copy()
+    st.session_state['history'] = []
+    st.session_state['changelog'] = []
+    # mark source (simple identity) so reloads reset session appropriately
+    st.session_state['source_id'] = id(df)
 
+work_df = st.session_state['work_df']
+
+# --------------------------- Detection summary ---------------------------
+st.subheader('Quick detection & summary')
+types_df = detect_types_fast(work_df)
+col1, col2 = st.columns([2,1])
+with col1:
+    st.write('Column types (sampling-based where applicable)')
+    st.dataframe(types_df)
+with col2:
+    st.write('Dataset summary')
+    st.metric('Rows', f"{len(work_df)}")
+    st.metric('Columns', f"{len(work_df.columns)}")
+    if 'changelog' in st.session_state:
+        st.write(f"Actions in session: {len(st.session_state['changelog'])}")
+
+# Mixed-type detection (sample based)
+mixed_report = []
+for col in work_df.columns:
+    if work_df[col].dtype == 'object':
+        sample_vals = sample_series(work_df[col], n=200)
+        types_seen = set([type(v).__name__ for v in sample_vals.tolist()])
+        if len(types_seen - set(['str', 'float', 'int', 'bool', 'NoneType'])) > 0 or len(types_seen) > 1:
+            mixed_report.append({'column': col, 'sample_types': list(types_seen)})
+if mixed_report:
+    with st.expander('Columns with mixed types (sampled)', expanded=False):
+        st.write(pd.DataFrame(mixed_report))
+        st.write('You can coerce these columns using the Schema UI below or the coercion tool in the column actions.')
+
+# --------------------------- Missing values & duplicates ---------------------------
+st.header('Missing values & duplicates')
+col_missing = work_df.isna().sum().sort_values(ascending=False)
+col_missing = col_missing[col_missing>0]
+if col_missing.empty:
+    st.success('No missing values detected')
+else:
+    mv_df = col_missing.reset_index()
+    mv_df.columns = ['column', 'missing_count']
+    mv_df['pct_missing'] = (mv_df['missing_count'] / len(work_df) * 100).round(2)
+    st.dataframe(mv_df)
+
+dup_count = work_df.duplicated().sum()
+st.metric('Duplicate rows', f"{dup_count}")
+if dup_count > 0:
+    if st.button('Show duplicate rows sample'):
+        st.dataframe(work_df[work_df.duplicated(keep=False)].head(200))
+
+# --------------------------- Column actions (coercion, impute, drop) ---------------------------
+st.header('Column actions')
+col_action = st.selectbox('Select column to act on', options=['--'] + list(work_df.columns))
+if col_action != '--':
     c1, c2, c3 = st.columns(3)
     with c1:
-        drop_cols = st.multiselect('Drop columns', options=work_df.columns.tolist())
-        if st.button('Apply drop'):
-            work_df.drop(columns=drop_cols, inplace=True)
-            st.success('Dropped selected columns')
-    with c2:
-        drop_rows = st.text_input('Drop rows by index (comma separated)')
-        if st.button('Apply row drop'):
-            if drop_rows.strip():
-                try:
-                    idxs = [int(x.strip()) for x in drop_rows.split(',') if x.strip()]
-                    work_df.drop(index=idxs, inplace=True)
-                    st.success('Dropped rows')
-                except Exception as e:
-                    st.error(f'Bad row indexes: {e}')
-    with c3:
-        impute_col = st.selectbox('Impute column', options=['--']+work_df.columns.tolist())
-        impute_strategy = st.selectbox('Strategy', options=['mean','median','mode','fill_value'])
-        if impute_strategy == 'fill_value':
-            fill_value = st.text_input('Value to fill with')
-        else:
-            fill_value = None
-        if st.button('Apply impute'):
-            if impute_col != '--':
-                try:
-                    if impute_strategy=='mean':
-                        val = work_df[impute_col].mean()
-                    elif impute_strategy=='median':
-                        val = work_df[impute_col].median()
-                    elif impute_strategy=='mode':
-                        val = work_df[impute_col].mode().iloc[0]
-                    else:
-                        val = fill_value
-                    work_df[impute_col].fillna(val, inplace=True)
-                    st.success('Imputed missing values')
-                except Exception as e:
-                    st.error(f'Impute error: {e}')
-
-    st.write("---")
-    st.subheader('Working data preview')
-    st.dataframe(work_df.head(200))
-
-    # Export
-    st.write("---")
-    st.header('Export cleaned data')
-    cexp1, cexp2 = st.columns([1,2])
-    with cexp1:
-        export_format = st.selectbox('Format', options=['csv','xlsx'])
-        export_name = st.text_input('Filename (without extension)', value='cleaned_data')
-        if st.button('Download'):
-            buf = io.BytesIO()
-            if export_format=='csv':
-                work_df.to_csv(buf, index=False)
-                buf.seek(0)
-                st.download_button('Click to download CSV', data=buf, file_name=f"{export_name}.csv", mime='text/csv')
-            else:
-                with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-                    work_df.to_excel(writer, index=False)
-                buf.seek(0)
-                st.download_button('Click to download Excel', data=buf, file_name=f"{export_name}.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-
-    # Save snapshot to session (so actions persist as user navigates)
-    st.session_state['work_df'] = work_df
-
-    # Quick insights using OpenAI (if key present) — minimal safe usage
-    st.write("---")
-    if 'OPENAI_API_KEY' in os.environ and os.environ['OPENAI_API_KEY']:
-        st.header('Automated insights (LLM) — quick summary')
-        if st.button('Generate quick insights'):
-            # Prepare a tiny summary (no heavy API calls)
+        st.write('Coerce column type (attempt)')
+        target_type = st.selectbox('To type', options=['numeric','int','float','datetime','string','category'], key='coerce_type')
+        if st.button('Coerce column'):
+            before_non_null = work_df[col_action].notna().sum()
+            before_sample_na = work_df[col_action].isna().sum()
+            snapshot = work_df.copy()
+            st.session_state['history'].append(snapshot)
             try:
-                sample = work_df.select_dtypes(include=[np.number]).describe().T.head(10).to_dict()
-                prompt = f"Provide 3 short analytical insights about this numeric summary: {sample}"
-                # A real environment would use the ChatCompletions API; keep this block minimal to avoid complexity.
-                resp = openai.ChatCompletion.create(
+                if target_type in ('numeric','float'):
+                    coerced = pd.to_numeric(work_df[col_action], errors='coerce')
+                elif target_type == 'int':
+                    coerced = pd.to_numeric(work_df[col_action], errors='coerce').dropna().astype('Int64')
+                elif target_type == 'datetime':
+                    coerced = pd.to_datetime(work_df[col_action], errors='coerce')
+                elif target_type == 'string':
+                    coerced = work_df[col_action].astype(str)
+                elif target_type == 'category':
+                    coerced = work_df[col_action].astype('category')
+                else:
+                    coerced = work_df[col_action]
+                work_df[col_action] = coerced
+                after_non_null = work_df[col_action].notna().sum()
+                details = {'column': col_action, 'action': 'coerce', 'to': target_type, 'before_non_null': int(before_non_null), 'after_non_null': int(after_non_null)}
+                log_action('coerce', details)
+                st.success(f'Attempted coercion to {target_type}. Non-null before: {before_non_null}, after: {after_non_null}')
+            except Exception as e:
+                st.error(f'Coercion failed: {e}')
+    with c2:
+        st.write('Impute missing values')
+        impute_strategy = st.selectbox('Strategy', options=['mean','median','mode','constant'], key='impute_strategy')
+        const_val = None
+        if impute_strategy == 'constant':
+            const_val = st.text_input('Constant value')
+        if st.button('Apply impute'):
+            if work_df[col_action].isna().sum() == 0:
+                st.info('No missing values in this column to impute')
+            else:
+                snapshot = work_df.copy()
+                st.session_state['history'].append(snapshot)
+                before_count = int(work_df[col_action].isna().sum())
+                before_stats = None
+                if pd.api.types.is_numeric_dtype(work_df[col_action]):
+                    before_stats = {'mean': float(work_df[col_action].mean()), 'median': float(work_df[col_action].median())}
+                try:
+                    if impute_strategy == 'mean':
+                        val = work_df[col_action].mean()
+                    elif impute_strategy == 'median':
+                        val = work_df[col_action].median()
+                    elif impute_strategy == 'mode':
+                        val = work_df[col_action].mode().iloc[0]
+                    else:
+                        val = const_val
+                    work_df[col_action].fillna(val, inplace=True)
+                    after_count = int(work_df[col_action].isna().sum())
+                    after_stats = None
+                    if pd.api.types.is_numeric_dtype(work_df[col_action]):
+                        after_stats = {'mean': float(work_df[col_action].mean()), 'median': float(work_df[col_action].median())}
+                    details = {'column': col_action, 'action': 'impute', 'strategy': impute_strategy, 'before_missing': before_count, 'after_missing': after_count, 'before_stats': before_stats, 'after_stats': after_stats}
+                    log_action('impute', details)
+                    st.success(f'Imputation applied. Missing before: {before_count}, after: {after_count}')
+                    if before_stats and after_stats:
+                        st.write('Before stats:', before_stats)
+                        st.write('After stats:', after_stats)
+                except Exception as e:
+                    st.error(f'Imputation failed: {e}')
+    with c3:
+        st.write('Drop column or sample rows')
+        if st.button('Drop column'):
+            snapshot = work_df.copy()
+            st.session_state['history'].append(snapshot)
+            work_df.drop(columns=[col_action], inplace=True)
+            log_action('drop_column', {'column': col_action})
+            st.success(f'Dropped column {col_action}')
+        rows_to_drop = st.text_input('Drop rows by index (comma separated)')
+        if st.button('Drop rows'):
+            try:
+                idxs = [int(x.strip()) for x in rows_to_drop.split(',') if x.strip()]
+                snapshot = work_df.copy()
+                st.session_state['history'].append(snapshot)
+                work_df.drop(index=idxs, inplace=True)
+                log_action('drop_rows', {'rows': idxs})
+                st.success('Dropped rows')
+            except Exception as e:
+                st.error(f'Bad row indexes: {e}')
+
+# --------------------------- Undo / History panel ---------------------------
+st.header('Session history & changelog')
+if st.button('Undo last action'):
+    if st.session_state['history']:
+        st.session_state['work_df'] = st.session_state['history'].pop()
+        work_df = st.session_state['work_df']
+        st.success('Undid last action')
+    else:
+        st.info('No actions to undo')
+
+if st.session_state.get('changelog'):
+    st.subheader('Changelog (recent)')
+    st.dataframe(pd.DataFrame(st.session_state['changelog']))
+    if st.download_button('Download changelog (JSON)', data=json.dumps(st.session_state['changelog'], indent=2), file_name='changelog.json'):
+        st.success('Changelog prepared for download')
+
+# --------------------------- Outlier detection ---------------------------
+st.header('Outliers')
+num_cols = [c for c in work_df.columns if pd.api.types.is_numeric_dtype(work_df[c])]
+if num_cols:
+    sel = st.selectbox('Select numeric column for outlier scan', options=num_cols, key='outlier_col')
+    mask = detect_outliers_iqr(work_df, sel)
+    st.write(f'Outliers found: {int(mask.sum())} of {len(work_df)}')
+    if int(mask.sum()) > 0:
+        st.dataframe(work_df.loc[mask, [sel]].head(200))
+        fig = px.box(work_df, y=sel, title=f'Box plot — {sel}')
+        st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info('No numeric columns for outlier detection')
+
+# --------------------------- LLM-driven quick insights (modern API) ---------------------------
+st.header('Automated insights (LLM) — optional')
+if openai_client is not None:
+    if st.button('Generate quick insights (LLM)'):
+        try:
+            numeric = work_df.select_dtypes(include=[np.number])
+            if numeric.shape[1] == 0:
+                st.info('No numeric columns to summarize.')
+            else:
+                sample = numeric.describe().T.head(15).to_dict()
+                prompt = f"Provide 3 succinct insights about this numeric summary: {sample}"
+                resp = openai_client.chat.completions.create(
                     model='gpt-4o-mini',
-                    messages=[{"role":"user","content":prompt}],
+                    messages=[{'role': 'user', 'content': prompt}],
                     max_tokens=200
                 )
-                text = resp['choices'][0]['message']['content']
+                # Modern response shape: assume choices[0].message.content
+                text = resp.choices[0].message.content
                 st.write(text)
-            except Exception as e:
-                st.error(f"LLM call failed (check key & quota): {e}")
-    else:
-        st.info("Set OPENAI_API_KEY in sidebar to enable automated insights.")
-
-    # Final documentation note
-    st.write("---")
-    st.markdown("**Notes:** This is a compact POC: extend validators, logging, schema enforcement, and add unit tests. Integrate with a background job queue for large files and add role-based access for multi-user scenarios.")
-
+        except Exception as e:
+            st.error(f'LLM call failed: {e}')
 else:
-    st.info("Upload a CSV / Excel file from the sidebar to get started.\n\nIf you want, drop a sample public dataset URL and I'll show how to wire it in.")
+    st.info('OpenAI client not initialized. Set OPENAI_API_KEY in sidebar to enable LLM insights.')
+
+# --------------------------- Export cleaned data and summary ---------------------------
+st.header('Export & summary')
+export_format = st.selectbox('Export format', options=['csv','xlsx','json'])
+export_name = st.text_input('Filename (without extension)', value='cleaned_data')
+if st.button('Prepare export'):
+    buf = io.BytesIO()
+    if export_format == 'csv':
+        work_df.to_csv(buf, index=False)
+        buf.seek(0)
+        st.download_button('Download CSV', data=buf, file_name=f'{export_name}.csv', mime='text/csv')
+    elif export_format == 'xlsx':
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            work_df.to_excel(writer, index=False)
+        buf.seek(0)
+        st.download_button('Download Excel', data=buf, file_name=f'{export_name}.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    else:
+        payload = work_df.to_json(orient='records')
+        st.download_button('Download JSON', data=payload, file_name=f'{export_name}.json', mime='application/json')
+    # Also provide a short export summary
+    summary = {'rows': int(len(work_df)), 'columns': int(len(work_df.columns)), 'timestamp': datetime.utcnow().isoformat()+'Z'}
+    st.write('Export summary:')
+    st.json(summary)
+    # append export to changelog
+    log_action('export', summary)
+
+# Final notes
+st.markdown('''
+**Next steps suggestions:**
+- Move utilities into `utils.py` and add unit tests for each helper.
+- Add CI workflow to run `pytest` on push.
+- Add persistent storage or database if you need to keep project state beyond a session.
+- Consider streaming/chunked processing for files > 100MB.
+''')
 
 # EOF
