@@ -5,3 +5,4 @@ plotly
 openai
 openpyxl
 pytest
+"xlrd>=2.0.1"

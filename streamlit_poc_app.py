@@ -1,15 +1,4 @@
-# streamlit_poc_app.py
-# POC Streamlit app — upgraded with requested changes
-# - Updated OpenAI usage to the modern client API
-# - File-size validation and configurable limit
-# - Sampling-based "numeric-ish" detection for performance
-# - Change-log / action history with before/after stats for cleaning actions
-# - Mixed-type detection and simple coercion UI
-# - Imputation shows before/after statistics
-#
-# Note: This file is intentionally self-contained for learning. For production
-# please split utilities into a `utils.py`, add unit tests, and add CI as discussed.
-
+# streamlit_poc_app.py (corrected)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -19,13 +8,13 @@ import json
 import plotly.express as px
 from datetime import datetime
 from utils import (
-    # load_csv,
     load_excel_sheets,
     sample_series,
-    # is_numeric_ish,
     detect_types_fast,
     detect_outliers_iqr,
     read_csv_chunks,
+    push_history,
+    pop_history,
 )
 
 # Try to import the modern OpenAI client. The package may expose it as
@@ -42,17 +31,13 @@ def main():
 
     # --------------------------- Configurable limits ---------------------------
     DEFAULT_MAX_FILE_MB = 50  # warn above this size
-    # SAMPLE_SIZE = 1000  # rows sampled for expensive heuristics
     MAX_HISTORY = 10  # keep last N snapshots in memory
 
-    # --------------------------- Utilities ---------------------------
-    # moved to utils.py and hence imported here
-
     # --------------------------- Change log helpers ---------------------------
-
     def log_action(action_type: str, details: dict):
         """Append an action summary to session_state['changelog'] with timestamp."""
         entry = {
+            # use naive ISO format for now; utils.make_changelog_entry uses timezone-aware
             "time": datetime.utcnow().isoformat() + "Z",
             "action": action_type,
             "details": details,
@@ -60,7 +45,6 @@ def main():
         if "changelog" not in st.session_state:
             st.session_state["changelog"] = []
         st.session_state["changelog"].append(entry)
-        # Bound the changelog size
         st.session_state["changelog"] = st.session_state["changelog"][-MAX_HISTORY:]
 
     # --------------------------- Sidebar: Env & Upload ---------------------------
@@ -71,19 +55,17 @@ def main():
     if api_key:
         os.environ["OPENAI_API_KEY"] = api_key
 
-    # Choose max upload limit for this session
     max_file_mb = st.sidebar.number_input(
         "Max file size (MB)", min_value=1, max_value=1024, value=DEFAULT_MAX_FILE_MB
     )
 
-    # Note on dependencies
     st.sidebar.markdown(
         "**Dependencies note:** `python-multipart` is not required for Streamlit uploads. "
         "Ensure `openpyxl` is present for Excel files.\n\n"
         "Recommended: `streamlit`, `pandas`, `numpy`, `plotly`, `openai`, `openpyxl`."
     )
 
-    # Initialize OpenAI client (modern API) if available and key present
+    # Initialize OpenAI client if available
     openai_client = None
     if OpenAIClient is not None and os.environ.get("OPENAI_API_KEY"):
         try:
@@ -104,7 +86,7 @@ def main():
         "Upload a tabular file (CSV / Excel). This POC shows fast detection, basic cleaning, a changelog, and optional LLM-driven insights."
     )
 
-    # Provide a small quick-example loader (user can paste a public CSV URL)
+    # sample loader
     with st.expander("Load sample public dataset (URL)", expanded=False):
         sample_url = st.text_input("Public CSV URL (e.g. raw GitHub file or data repo)")
         if st.button("Load sample URL") and sample_url:
@@ -115,7 +97,7 @@ def main():
             except Exception as e:
                 st.error(f"Failed to load sample: {e}")
 
-    # Use either uploaded file or session sample
+    # data sources
     df = None
     sheets = None
     selected_sheet = None
@@ -123,11 +105,9 @@ def main():
         df = st.session_state["uploaded_df"]
 
     if uploaded_file is not None:
-        # File size validation — Streamlit's uploaded_file has .size in bytes
         try:
             size_mb = uploaded_file.size / (1024 * 1024)
         except Exception:
-            # fallback: unknown size — proceed but warn
             size_mb = None
 
         if size_mb is not None and size_mb > max_file_mb:
@@ -154,14 +134,12 @@ def main():
             except Exception as e:
                 st.error(f"Failed to read file: {e}")
 
-    # If still no df, show instructions and stop
     if df is None:
         st.info(
             "Upload a CSV/Excel file from the sidebar or load a public CSV URL above to get started."
         )
         st.stop()
 
-    # Ensure df is a DataFrame
     if not isinstance(df, pd.DataFrame):
         st.error("Loaded object is not a DataFrame")
         st.stop()
@@ -169,9 +147,14 @@ def main():
     # Initialize working copy and history
     if "work_df" not in st.session_state or st.session_state.get("source_id") != id(df):
         st.session_state["work_df"] = df.copy()
-        st.session_state["history"] = []
+        # **Fix**: pass the DataFrame (or st.session_state["work_df"]) to push_history
+        push_history(
+            st.session_state,
+            st.session_state["work_df"],
+            mem_threshold_mb=10.0,
+            max_total_mb=200.0,
+        )
         st.session_state["changelog"] = []
-        # mark source (simple identity) so reloads reset session appropriately
         st.session_state["source_id"] = id(df)
 
     work_df = st.session_state["work_df"]
@@ -242,18 +225,22 @@ def main():
             )
             if st.button("Coerce column"):
                 before_non_null = work_df[col_action].notna().sum()
-                # before_sample_na = work_df[col_action].isna().sum()
-                snapshot = work_df.copy()
-                st.session_state["history"].append(snapshot)
+                # snapshot handled by push_history
+                push_history(
+                    st.session_state, work_df, mem_threshold_mb=10.0, max_total_mb=200.0
+                )
                 try:
                     if target_type in ("numeric", "float"):
                         coerced = pd.to_numeric(work_df[col_action], errors="coerce")
+                        # keep as Float64 extension for NaNs
+                        coerced = coerced.astype("Float64")
                     elif target_type == "int":
-                        coerced = (
-                            pd.to_numeric(work_df[col_action], errors="coerce")
-                            .dropna()
-                            .astype("Int64")
-                        )
+                        coerced = pd.to_numeric(work_df[col_action], errors="coerce")
+                        # safe cast to pandas nullable integer dtype
+                        if coerced.isna().any():
+                            coerced = coerced.astype("Int64")
+                        else:
+                            coerced = coerced.astype("int64")
                     elif target_type == "datetime":
                         coerced = pd.to_datetime(work_df[col_action], errors="coerce")
                     elif target_type == "string":
@@ -291,8 +278,12 @@ def main():
                 if work_df[col_action].isna().sum() == 0:
                     st.info("No missing values in this column to impute")
                 else:
-                    snapshot = work_df.copy()
-                    st.session_state["history"].append(snapshot)
+                    push_history(
+                        st.session_state,
+                        work_df,
+                        mem_threshold_mb=10.0,
+                        max_total_mb=200.0,
+                    )
                     before_count = int(work_df[col_action].isna().sum())
                     before_stats = None
                     if pd.api.types.is_numeric_dtype(work_df[col_action]):
@@ -338,8 +329,9 @@ def main():
         with c3:
             st.write("Drop column or sample rows")
             if st.button("Drop column"):
-                snapshot = work_df.copy()
-                st.session_state["history"].append(snapshot)
+                push_history(
+                    st.session_state, work_df, mem_threshold_mb=10.0, max_total_mb=200.0
+                )
                 work_df.drop(columns=[col_action], inplace=True)
                 log_action("drop_column", {"column": col_action})
                 st.success(f"Dropped column {col_action}")
@@ -349,8 +341,12 @@ def main():
                     idxs = [
                         int(x.strip()) for x in rows_to_drop.split(",") if x.strip()
                     ]
-                    snapshot = work_df.copy()
-                    st.session_state["history"].append(snapshot)
+                    push_history(
+                        st.session_state,
+                        work_df,
+                        mem_threshold_mb=10.0,
+                        max_total_mb=200.0,
+                    )
                     work_df.drop(index=idxs, inplace=True)
                     log_action("drop_rows", {"rows": idxs})
                     st.success("Dropped rows")
@@ -360,22 +356,27 @@ def main():
     # --------------------------- Undo / History panel ---------------------------
     st.header("Session history & changelog")
     if st.button("Undo last action"):
-        if st.session_state["history"]:
-            st.session_state["work_df"] = st.session_state["history"].pop()
+        prev = pop_history(st.session_state)
+        if prev is not None and isinstance(prev, pd.DataFrame):
+            st.session_state["work_df"] = prev
             work_df = st.session_state["work_df"]
             st.success("Undid last action")
         else:
             st.info("No actions to undo")
 
-    if st.session_state.get("changelog"):
-        st.subheader("Changelog (recent)")
-        st.dataframe(pd.DataFrame(st.session_state["changelog"]))
-        if st.download_button(
+    st.subheader("Changelog (recent)")
+    chlog = st.session_state.get("changelog", [])
+    if chlog:
+        st.dataframe(pd.DataFrame(chlog))
+        st.download_button(
             "Download changelog (JSON)",
-            data=json.dumps(st.session_state["changelog"], indent=2),
+            data=json.dumps(chlog, indent=2),
             file_name="changelog.json",
-        ):
-            st.success("Changelog prepared for download")
+        )
+    else:
+        st.info(
+            "No actions recorded yet. Perform coerce / impute / drop to populate the changelog."
+        )
 
     # --------------------------- Outlier detection ---------------------------
     st.header("Outliers")
@@ -411,8 +412,15 @@ def main():
                         messages=[{"role": "user", "content": prompt}],
                         max_tokens=200,
                     )
-                    # Modern response shape: assume choices[0].message.content
-                    text = resp.choices[0].message.content
+                    # Robust extraction of text from response
+                    text = None
+                    try:
+                        text = resp.choices[0].message.content
+                    except Exception:
+                        try:
+                            text = resp["choices"][0]["message"]["content"]
+                        except Exception:
+                            text = str(resp)
                     st.write(text)
             except Exception as e:
                 st.error(f"LLM call failed: {e}")
@@ -454,7 +462,7 @@ def main():
                 file_name=f"{export_name}.json",
                 mime="application/json",
             )
-        # Also provide a short export summary
+
         summary = {
             "rows": int(len(work_df)),
             "columns": int(len(work_df.columns)),
@@ -462,10 +470,8 @@ def main():
         }
         st.write("Export summary:")
         st.json(summary)
-        # append export to changelog
         log_action("export", summary)
 
-    # Final notes
     st.markdown(
         """
     **Next steps suggestions:**

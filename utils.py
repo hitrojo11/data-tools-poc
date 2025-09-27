@@ -1,7 +1,58 @@
-# utils.py
+# utils.py (corrected)
 import pandas as pd
+import os
+import pickle
+import gzip
+import tempfile
+from typing import Dict, Any
+from datetime import datetime, timezone
 
-# import numpy as np
+
+def estimate_df_size_mb(df: pd.DataFrame) -> float:
+    return float(df.memory_usage(deep=True).sum()) / (1024 * 1024)
+
+
+def save_snapshot_to_tempfile(
+    df: pd.DataFrame, compress: bool = True
+) -> Dict[str, Any]:
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".pkl.gz" if compress else ".pkl"
+    )
+    tmp_path = tmp.name
+    tmp.close()
+    if compress:
+        with gzip.open(tmp_path, "wb") as f:
+            pickle.dump(df, f, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        with open(tmp_path, "wb") as f:
+            pickle.dump(df, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return {
+        "path": tmp_path,
+        "size_mb": os.path.getsize(tmp_path) / (1024 * 1024),
+        "nrows": len(df),
+        "ncols": len(df.columns),
+    }
+
+
+def load_snapshot_from_tempfile(meta: Dict[str, Any]) -> pd.DataFrame:
+    path = meta.get("path")
+    if path is None or not os.path.exists(path):
+        return pd.DataFrame()
+    if path.endswith(".gz") or path.endswith(".pkl.gz"):
+        with gzip.open(path, "rb") as f:
+            return pickle.load(f)
+    else:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+
+def remove_snapshot_file(meta: Dict[str, Any]) -> None:
+    path = meta.get("path")
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
 
 
 def load_csv(file) -> pd.DataFrame:
@@ -69,7 +120,6 @@ def detect_outliers_iqr(df: pd.DataFrame, col: str) -> pd.Series:
     return (df[col] < lower) | (df[col] > upper)
 
 
-# in utils.py (append)
 def validate_schema(df: pd.DataFrame, schema: dict) -> dict:
     errors = []
     for col, expected in schema.items():
@@ -91,40 +141,125 @@ def apply_schema(df: pd.DataFrame, schema: dict) -> pd.DataFrame:
     df2 = df.copy()
     for col, expected in schema.items():
         if col not in df2.columns:
-            # continue
-            try:
-                if expected == "float":
-                    df2[col] = pd.to_numeric(df2[col], errors="coerce").astype(float)
-                elif expected == "int":
-                    df2[col] = pd.to_numeric(df2[col], errors="coerce").astype("Int64")
-                elif expected == "datetime":
-                    df2[col] = pd.to_datetime(df2[col], errors="coerce")
-                elif expected == "string":
-                    df2[col] = df2[col].astype(str)
-                elif expected == "category":
-                    df2[col] = df2[col].astype("category")
-            except Exception:
-                pass
+            continue
+        try:
+            if expected == "float":
+                coerced = pd.to_numeric(df2[col], errors="coerce")
+                df2[col] = coerced.astype("Float64")
+            elif expected == "int":
+                coerced = pd.to_numeric(df2[col], errors="coerce")
+                if coerced.isna().any():
+                    df2[col] = coerced.astype("Int64")
+                else:
+                    df2[col] = coerced.astype("int64")
+            elif expected == "datetime":
+                df2[col] = pd.to_datetime(df2[col], errors="coerce")
+            elif expected == "string":
+                df2[col] = df2[col].astype("string")
+            elif expected == "category":
+                df2[col] = df2[col].astype("category")
+        except Exception:
+            # leave unchanged on failure
+            pass
     return df2
 
 
 def make_changelog_entry(action_type: str, details: dict) -> dict:
-    from datetime import datetime
-
     return {
-        "time": datetime.utcnow().isoformat() + "Z",
+        "time": datetime.now(timezone.utc).isoformat(),
         "action": action_type,
         "details": details,
     }
 
 
 def read_csv_chunks(file, chunksize=200_000, max_rows=1_000_000):
-    it = pd.read_csv(file, chunksize=chunksize)
     parts = []
     rows = 0
-    for chunk in it:
+    # pd.read_csv supports file-like objects and paths
+    for chunk in pd.read_csv(file, chunksize=chunksize):
         parts.append(chunk)
         rows += len(chunk)
         if rows >= max_rows:
             break
+    if not parts:
+        return pd.DataFrame()
     return pd.concat(parts, ignore_index=True)
+
+
+def push_history(
+    session_state: dict,
+    df: pd.DataFrame,
+    mem_threshold_mb: float = 20.0,
+    max_total_mb: float = 200.0,
+):
+    if "history" not in session_state:
+        session_state["history"] = []
+    size_mb = estimate_df_size_mb(df)
+    if size_mb <= mem_threshold_mb:
+        snap = {"type": "mem", "df": df.copy(), "size_mb": size_mb}
+    else:
+        meta = save_snapshot_to_tempfile(df)
+        snap = {"type": "disk", "meta": meta, "size_mb": meta["size_mb"]}
+    session_state["history"].append(snap)
+    total = sum([s.get("size_mb", 0) for s in session_state["history"]])
+    while total > max_total_mb and session_state["history"]:
+        old = session_state["history"].pop(0)
+        if old["type"] == "disk":
+            remove_snapshot_file(old["meta"])
+        total = sum([s.get("size_mb", 0) for s in session_state["history"]])
+
+
+def pop_history(session_state: dict):
+    if "history" not in session_state or not session_state["history"]:
+        return None
+    last = session_state["history"].pop()
+    if last["type"] == "mem":
+        return last["df"]
+    else:
+        df = load_snapshot_from_tempfile(last["meta"])
+        remove_snapshot_file(last["meta"])
+        return df
+
+
+def validate_schema_with_report(df: pd.DataFrame, schema: dict, sample_n: int = 200):
+    reports = {}
+    errors = []
+    for col, expected in schema.items():
+        if col not in df.columns:
+            errors.append(f"Missing column: {col}")
+            continue
+
+        series = df[col].dropna()
+        # choose a sample (or the whole thing if small)
+        sample = (
+            series.iloc[:sample_n]
+            if len(series) <= sample_n
+            else series.sample(n=sample_n, random_state=0)
+        )
+
+        # If no non-null values in sample, treat as "no evidence of failure" -> success_ratio 1.0
+        if len(sample) == 0:
+            success_ratio = 1.0
+            failing = []
+        else:
+            if expected in ("int", "float"):
+                coerced = pd.to_numeric(sample, errors="coerce")
+                success_ratio = coerced.notna().mean()
+                failing = sample[coerced.isna()].head(5).tolist()
+            elif expected == "datetime":
+                coerced = pd.to_datetime(sample, errors="coerce")
+                success_ratio = coerced.notna().mean()
+                failing = sample[coerced.isna()].head(5).tolist()
+            else:
+                success_ratio = 1.0
+                failing = []
+
+        reports[col] = {
+            "expected": expected,
+            "success_ratio": float(success_ratio),
+            "examples_failing": failing,
+        }
+    ok = (
+        all(r.get("success_ratio", 1.0) >= 0.9 for r in reports.values()) and not errors
+    )
+    return {"ok": ok, "column_reports": reports, "errors": errors}
