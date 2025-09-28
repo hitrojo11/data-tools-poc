@@ -1,4 +1,4 @@
-# streamlit_poc_app.py (corrected)
+# streamlit_poc_app.py (updated)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -16,6 +16,8 @@ from utils import (
     push_history,
     pop_history,
 )
+from typing import cast, Any
+from collections.abc import MutableMapping
 
 # Try to import the modern OpenAI client. The package may expose it as
 # `from openai import OpenAI` depending on the installed version. We handle
@@ -94,8 +96,8 @@ def main():
                 df_sample = pd.read_csv(sample_url)
                 st.session_state["uploaded_df"] = df_sample
                 st.success("Sample loaded into session (saved as uploaded_df)")
-            except Exception as e:
-                st.error(f"Failed to load sample: {e}")
+            except Exception:
+                st.error("Failed to load sample")
 
     # data sources
     df = None
@@ -118,19 +120,33 @@ def main():
             name = uploaded_file.name.lower()
             try:
                 if name.endswith(".csv"):
+                    uploaded_file.seek(0)
                     df = read_csv_chunks(
                         uploaded_file, chunksize=100_000, max_rows=500_000
                     )
                 else:
-                    sheets = load_excel_sheets(uploaded_file)
-                    sheet_names = list(sheets.keys())
-                    selected_sheet = st.sidebar.selectbox(
-                        "Choose worksheet", options=sheet_names
-                    )
-                    if selected_sheet:
-                        df = sheets[selected_sheet]
-                    else:
-                        df = sheets[sheet_names[0]]
+                    # Excel handling: parse sheets and let user choose
+                    try:
+                        uploaded_file.seek(0)  # Ensure file pointer is reset for Excel
+                        sheets = load_excel_sheets(uploaded_file)
+                    except Exception as e:
+                        st.error(f"Failed to read Excel file: {e}")
+                        sheets = None
+
+                    if sheets:
+                        sheet_names = list(sheets.keys())
+                        # Put the selector in the sidebar (easy to notice)
+                        selected_sheet = st.sidebar.selectbox(
+                            "Choose worksheet", options=sheet_names
+                        )
+                        st.write(
+                            f"Available sheets: {sheet_names}"
+                        )  # Optional debug line
+                        if selected_sheet:
+                            df = sheets[selected_sheet]
+                        else:
+                            # Fallback to first sheet
+                            df = sheets[sheet_names[0]]
             except Exception as e:
                 st.error(f"Failed to read file: {e}")
 
@@ -279,7 +295,7 @@ def main():
                     st.info("No missing values in this column to impute")
                 else:
                     push_history(
-                        st.session_state,
+                        cast(MutableMapping[Any, Any], st.session_state),
                         work_df,
                         mem_threshold_mb=10.0,
                         max_total_mb=200.0,
@@ -330,7 +346,10 @@ def main():
             st.write("Drop column or sample rows")
             if st.button("Drop column"):
                 push_history(
-                    st.session_state, work_df, mem_threshold_mb=10.0, max_total_mb=200.0
+                    cast(MutableMapping[Any, Any], st.session_state),
+                    work_df,
+                    mem_threshold_mb=10.0,
+                    max_total_mb=200.0,
                 )
                 work_df.drop(columns=[col_action], inplace=True)
                 log_action("drop_column", {"column": col_action})
@@ -342,7 +361,7 @@ def main():
                         int(x.strip()) for x in rows_to_drop.split(",") if x.strip()
                     ]
                     push_history(
-                        st.session_state,
+                        cast(MutableMapping[Any, Any], st.session_state),
                         work_df,
                         mem_threshold_mb=10.0,
                         max_total_mb=200.0,
@@ -356,7 +375,7 @@ def main():
     # --------------------------- Undo / History panel ---------------------------
     st.header("Session history & changelog")
     if st.button("Undo last action"):
-        prev = pop_history(st.session_state)
+        prev = pop_history(cast(MutableMapping[Any, Any], st.session_state))
         if prev is not None and isinstance(prev, pd.DataFrame):
             st.session_state["work_df"] = prev
             work_df = st.session_state["work_df"]
@@ -387,12 +406,15 @@ def main():
             options=num_cols,
             key="outlier_col",
         )
-        mask = detect_outliers_iqr(work_df, sel)
-        st.write(f"Outliers found: {int(mask.sum())} of {len(work_df)}")
-        if int(mask.sum()) > 0:
-            st.dataframe(work_df.loc[mask, [sel]].head(200))
-            fig = px.box(work_df, y=sel, title=f"Box plot — {sel}")
-            st.plotly_chart(fig, use_container_width=True)
+        if sel:
+            mask = detect_outliers_iqr(work_df, sel)
+            st.write(f"Outliers found: {int(mask.sum())} of {len(work_df)}")
+            if int(mask.sum()) > 0:
+                st.dataframe(work_df.loc[mask, [sel]].head(200))
+                fig = px.box(work_df, y=sel, title=f"Box plot — {sel}")
+                st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No numeric column selected for outlier detection.")
     else:
         st.info("No numeric columns for outlier detection")
 
@@ -407,20 +429,41 @@ def main():
                 else:
                     sample = numeric.describe().T.head(15).to_dict()
                     prompt = f"Provide 3 succinct insights about this numeric summary: {sample}"
-                    resp = openai_client.chat.completions.create(
+                    resp: Any = openai_client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[{"role": "user", "content": prompt}],
                         max_tokens=200,
                     )
-                    # Robust extraction of text from response
+                    # Robust extraction of text from response (handle SDK objects and dict-like shapes)
                     text = None
+                    # prefer attribute access if SDK exposes choices
                     try:
-                        text = resp.choices[0].message.content
+                        if hasattr(resp, "choices"):
+                            # typical SDK pattern: resp.choices[0].message.content
+                            try:
+                                text = resp.choices[0].message.content
+                            except Exception:
+                                # some SDK versions might not have .message or .content nested that way
+                                pass
                     except Exception:
+                        pass
+
+                    # fallback to dict-like extraction if attribute path didn't work
+                    if text is None:
                         try:
-                            text = resp["choices"][0]["message"]["content"]
+                            if hasattr(resp, "to_dict"):
+                                rdict = resp.to_dict()
+                            else:
+                                # try to coerce to mapping
+                                rdict = dict(resp)
+                            text = (
+                                rdict.get("choices", [{}])[0]
+                                .get("message", {})
+                                .get("content")
+                            )
                         except Exception:
                             text = str(resp)
+
                     st.write(text)
             except Exception as e:
                 st.error(f"LLM call failed: {e}")

@@ -4,7 +4,8 @@ import os
 import pickle
 import gzip
 import tempfile
-from typing import Dict, Any
+from collections.abc import MutableMapping
+from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 
 
@@ -40,10 +41,10 @@ def load_snapshot_from_tempfile(meta: Dict[str, Any]) -> pd.DataFrame:
         return pd.DataFrame()
     if path.endswith(".gz") or path.endswith(".pkl.gz"):
         with gzip.open(path, "rb") as f:
-            return pickle.load(f)
+            return pickle.load(f)  # type: ignore[arg-type]
     else:
         with open(path, "rb") as f:
-            return pickle.load(f)
+            return pickle.load(f)  # type: ignore[arg-type]
 
 
 def remove_snapshot_file(meta: Dict[str, Any]) -> None:
@@ -60,8 +61,53 @@ def load_csv(file) -> pd.DataFrame:
 
 
 def load_excel_sheets(file):
-    xl = pd.ExcelFile(file)
-    return {name: xl.parse(name) for name in xl.sheet_names}
+    """
+    Read an uploaded Excel file (Streamlit UploadedFile or path-like).
+    Returns: dict of {sheet_name: DataFrame}
+    Uses openpyxl for .xlsx and xlrd for .xls when available; falls back gracefully.
+    """
+    # rewind file-like object if possible
+    try:
+        file.seek(0)
+    except Exception:
+        pass
+
+    # determine extension if available
+    fname = getattr(file, "name", None)
+    ext = None
+    if fname and "." in fname:
+        ext = fname.rsplit(".", 1)[1].lower()
+
+    # choose engine
+    engine = None
+    if ext == "xls":
+        engine = "xlrd"
+    elif ext == "xlsx":
+        engine = "openpyxl"
+
+    # Try with chosen engine first, fall back to pandas default auto-detection
+    try:
+        if engine:
+            xl = pd.ExcelFile(file, engine=engine)
+        else:
+            xl = pd.ExcelFile(file)
+        sheets = {name: xl.parse(name) for name in xl.sheet_names}
+        return sheets
+    except Exception:
+        # last-resort: try without specifying engine (pandas will try)
+        try:
+            try:
+                file.seek(0)
+            except Exception:
+                pass
+            xl = pd.ExcelFile(file)
+            sheets = {name: xl.parse(name) for name in xl.sheet_names}
+            return sheets
+        except Exception as e2:
+            # bubble up a helpful error so UI can show message
+            raise RuntimeError(
+                f"Could not read Excel file (tried engine={engine}): {e2}"
+            )
 
 
 def sample_series(series: pd.Series, n=1000):
@@ -187,11 +233,11 @@ def read_csv_chunks(file, chunksize=200_000, max_rows=1_000_000):
 
 
 def push_history(
-    session_state: dict,
+    session_state: MutableMapping[Any, Any],
     df: pd.DataFrame,
     mem_threshold_mb: float = 20.0,
     max_total_mb: float = 200.0,
-):
+) -> None:
     if "history" not in session_state:
         session_state["history"] = []
     size_mb = estimate_df_size_mb(df)
@@ -209,7 +255,7 @@ def push_history(
         total = sum([s.get("size_mb", 0) for s in session_state["history"]])
 
 
-def pop_history(session_state: dict):
+def pop_history(session_state: MutableMapping[Any, Any]) -> Optional[pd.DataFrame]:
     if "history" not in session_state or not session_state["history"]:
         return None
     last = session_state["history"].pop()
