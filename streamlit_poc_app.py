@@ -18,6 +18,22 @@ from utils import (
 )
 from typing import cast, Any
 from collections.abc import MutableMapping
+from session_adapter import ensure_defaults
+from utils import cleanup_orphan_snapshots
+
+
+try:
+    removed = cleanup_orphan_snapshots(ttl_hours=24.0)
+    if removed and removed > 5:
+        st.info(
+            f"Cleaned up {removed} old snapshot files."
+        )  # optional, can be removed if noisy
+except Exception:
+    # avoid breaking startup if cleanup fails
+    pass
+
+# ensure session state keys exist with default values
+ensure_defaults(st.session_state)
 
 # Try to import the modern OpenAI client. The package may expose it as
 # `from openai import OpenAI` depending on the installed version. We handle

@@ -1,0 +1,128 @@
+*** Begin Patch
+*** Update File: streamlit_poc_app.py
+@@
+ import plotly.express as px
+ from datetime import datetime
+ from utils import (
+     load_excel_sheets,
+     sample_series,
+     detect_types_fast,
+     detect_outliers_iqr,
+     read_csv_chunks,
+     push_history,
+     pop_history,
+ )
++from typing import cast, Any
++from collections.abc import MutableMapping
+@@
+-                if target_type in ("numeric", "float"):
+-                        coerced = pd.to_numeric(work_df[col_action], errors="coerce")
+-                        # keep as Float64 extension for NaNs
+-                        coerced = coerced.astype("Float64")
++                    if target_type in ("numeric", "float"):
++                        coerced = pd.to_numeric(work_df[col_action], errors="coerce")
++                        # keep as Float64 extension for NaNs
++                        coerced = coerced.astype("Float64")
+@@
+-                    work_df[col_action] = coerced
++                    work_df[col_action] = coerced
+                     after_non_null = work_df[col_action].notna().sum()
+@@
+-                    push_history(st.session_state, work_df, mem_threshold_mb=10.0, max_total_mb=200.0)
++                    push_history(cast(MutableMapping[str, Any], st.session_state), work_df, mem_threshold_mb=10.0, max_total_mb=200.0)
+@@
+-                push_history(st.session_state, work_df, mem_threshold_mb=10.0, max_total_mb=200.0)
++                    push_history(cast(MutableMapping[str, Any], st.session_state), work_df, mem_threshold_mb=10.0, max_total_mb=200.0)
+@@
+-                push_history(st.session_state, work_df, mem_threshold_mb=10.0, max_total_mb=200.0)
++                    push_history(cast(MutableMapping[str, Any], st.session_state), work_df, mem_threshold_mb=10.0, max_total_mb=200.0)
+@@
+-    if st.button("Undo last action"):
+-        prev = pop_history(st.session_state)
+-        if prev is not None and isinstance(prev, pd.DataFrame):
+-            st.session_state["work_df"] = prev
+-            work_df = st.session_state["work_df"]
+-            st.success("Undid last action")
+-        else:
+-            st.info("No actions to undo")
++    if st.button("Undo last action"):
++        prev = pop_history(cast(MutableMapping[str, Any], st.session_state))
++        if prev is not None and isinstance(prev, pd.DataFrame):
++            st.session_state["work_df"] = prev
++            work_df = st.session_state["work_df"]
++            st.success("Undid last action")
++        else:
++            st.info("No actions to undo")
+@@
+-    if num_cols:
+-        sel = st.selectbox("Select numeric column for outlier scan", options=num_cols, key="outlier_col")
+-        mask = detect_outliers_iqr(work_df, sel)
+-        st.write(f"Outliers found: {int(mask.sum())} of {len(work_df)}")
+-        if int(mask.sum()) > 0:
+-            st.dataframe(work_df.loc[mask, [sel]].head(200))
+-            fig = px.box(work_df, y=sel, title=f"Box plot — {sel}")
+-            st.plotly_chart(fig, use_container_width=True)
+-    else:
+-        st.info("No numeric columns for outlier detection")
++    if num_cols:
++        sel = st.selectbox("Select numeric column for outlier scan", options=num_cols, key="outlier_col")
++        if sel:
++            mask = detect_outliers_iqr(work_df, sel)
++            st.write(f"Outliers found: {int(mask.sum())} of {len(work_df)}")
++            if int(mask.sum()) > 0:
++                st.dataframe(work_df.loc[mask, [sel]].head(200))
++                fig = px.box(work_df, y=sel, title=f"Box plot — {sel}")
++                st.plotly_chart(fig, use_container_width=True)
++        else:
++            st.info("No numeric column selected for outlier detection.")
++    else:
++        st.info("No numeric columns for outlier detection")
+@@
+-                    resp = openai_client.chat.completions.create(
+-                        model="gpt-4o-mini",
+-                        messages=[{"role": "user", "content": prompt}],
+-                        max_tokens=200,
+-                    )
+-                    # Robust extraction of text from response
+-                    text = None
+-                    try:
+-                        text = resp.choices[0].message.content
+-                    except Exception:
+-                        try:
+-                            text = resp["choices"][0]["message"]["content"]
+-                        except Exception:
+-                            text = str(resp)
+-                    st.write(text)
++                    resp = openai_client.chat.completions.create(
++                        model="gpt-4o-mini",
++                        messages=[{"role": "user", "content": prompt}],
++                        max_tokens=200,
++                    )
++                    # Robust extraction of text from response (handle SDK objects and dict-like shapes)
++                    text = None
++                    # prefer attribute access if SDK exposes choices
++                    try:
++                        if hasattr(resp, "choices"):
++                            # typical SDK pattern: resp.choices[0].message.content
++                            try:
++                                text = resp.choices[0].message.content
++                            except Exception:
++                                # some SDK versions might not have .message or .content nested that way
++                                pass
++                    except Exception:
++                        pass
++
++                    # fallback to dict-like extraction if attribute path didn't work
++                    if text is None:
++                        try:
++                            if hasattr(resp, "to_dict"):
++                                rdict = resp.to_dict()
++                            else:
++                                # try to coerce to mapping
++                                rdict = dict(resp)
++                            text = rdict.get("choices", [{}])[0].get("message", {}).get("content")
++                        except Exception:
++                            text = str(resp)
++
++                    st.write(text)
+*** End Patch

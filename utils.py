@@ -4,56 +4,99 @@ import os
 import pickle
 import gzip
 import tempfile
+import time
 from collections.abc import MutableMapping
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
+
+SNAPSHOT_PREFIX = "dtpoc_snapshot_"  # consistent prefix for cleanup discovery
+SNAPSHOT_SUFFIX = ".pkl.gz"
 
 
 def estimate_df_size_mb(df: pd.DataFrame) -> float:
     return float(df.memory_usage(deep=True).sum()) / (1024 * 1024)
 
 
-def save_snapshot_to_tempfile(
-    df: pd.DataFrame, compress: bool = True
-) -> Dict[str, Any]:
-    tmp = tempfile.NamedTemporaryFile(
-        delete=False, suffix=".pkl.gz" if compress else ".pkl"
+def save_snapshot_to_tempfile(df) -> Dict[str, Any]:
+    """
+    Save DataFrame snapshot to a gzipped pickle in tmp with a consistent prefix.
+    Returns metadata dict {path, size_mb, created_at}.
+    """
+    ts = int(time.time())
+    fd, path = tempfile.mkstemp(
+        prefix=SNAPSHOT_PREFIX + str(ts) + "_", suffix=SNAPSHOT_SUFFIX
     )
-    tmp_path = tmp.name
-    tmp.close()
-    if compress:
-        with gzip.open(tmp_path, "wb") as f:
-            pickle.dump(df, f, protocol=pickle.HIGHEST_PROTOCOL)
-    else:
-        with open(tmp_path, "wb") as f:
-            pickle.dump(df, f, protocol=pickle.HIGHEST_PROTOCOL)
-    return {
-        "path": tmp_path,
-        "size_mb": os.path.getsize(tmp_path) / (1024 * 1024),
-        "nrows": len(df),
-        "ncols": len(df.columns),
-    }
-
-
-def load_snapshot_from_tempfile(meta: Dict[str, Any]) -> pd.DataFrame:
-    path = meta.get("path")
-    if path is None or not os.path.exists(path):
-        return pd.DataFrame()
-    if path.endswith(".gz") or path.endswith(".pkl.gz"):
-        with gzip.open(path, "rb") as f:
-            return pickle.load(f)  # type: ignore[arg-type]
-    else:
-        with open(path, "rb") as f:
-            return pickle.load(f)  # type: ignore[arg-type]
-
-
-def remove_snapshot_file(meta: Dict[str, Any]) -> None:
-    path = meta.get("path")
-    if path and os.path.exists(path):
+    os.close(fd)  # we will write with gzip.open
+    try:
+        with gzip.open(path, "wb") as f:
+            pickle.dump(df, f)
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        return {"path": path, "size_mb": size_mb, "created_at": ts}
+    except Exception:
+        # Attempt to remove partial file if write failed
         try:
             os.remove(path)
         except Exception:
             pass
+        raise
+
+
+def load_snapshot_from_tempfile(meta: Dict[str, Any]):
+    """
+    Load snapshot from metadata returned by save_snapshot_to_tempfile.
+    """
+    path = meta.get("path")
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"Snapshot file not found: {path}")
+    # read gzipped pickle
+    with gzip.open(path, "rb") as f:
+        return pickle.load(f)  # type: ignore[arg-type]
+
+
+def remove_snapshot_file(meta: Dict[str, Any]) -> None:
+    p = meta.get("path")
+    if p and os.path.exists(p):
+        try:
+            os.remove(p)
+        except Exception:
+            # best-effort, don't raise
+            pass
+
+
+def cleanup_orphan_snapshots(
+    ttl_hours: float = 24.0, temp_dir: Optional[str] = None
+) -> int:
+    """
+    Remove snapshot files created by this app older than ttl_hours.
+    Returns the number of files removed.
+    """
+    if temp_dir is None:
+        temp_dir = tempfile.gettempdir()
+    removed = 0
+    now = time.time()
+    ttl_seconds = ttl_hours * 3600
+    try:
+        for fname in os.listdir(temp_dir):
+            if not fname.startswith(SNAPSHOT_PREFIX) or not fname.endswith(
+                SNAPSHOT_SUFFIX
+            ):
+                continue
+            path = os.path.join(temp_dir, fname)
+            try:
+                mtime = os.path.getmtime(path)
+                if (now - mtime) > ttl_seconds:
+                    try:
+                        os.remove(path)
+                        removed += 1
+                    except Exception:
+                        # ignore individual failures
+                        pass
+            except OSError:
+                pass
+    except Exception:
+        # best-effort, do not raise to avoid breaking app startup
+        return removed
+    return removed
 
 
 def load_csv(file) -> pd.DataFrame:
